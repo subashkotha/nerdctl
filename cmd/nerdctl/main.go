@@ -282,6 +282,7 @@ Config file ($NERDCTL_TOML): %s
 		container.WaitCommand(),
 		container.RenameCommand(),
 		container.AttachCommand(),
+		container.HealthCheckCommand(),
 		// #endregion
 
 		// Build
