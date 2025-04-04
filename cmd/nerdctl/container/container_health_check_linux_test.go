@@ -2,6 +2,7 @@ package container
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/containerd/nerdctl/mod/tigron/expect"
@@ -173,23 +174,28 @@ func TestContainerHealthCheck(t *testing.T) {
 						}
 					},
 				},
-				// {
-				// 	Description: "Health check with timeout",
-				// 	Setup: func(data test.Data, helpers test.Helpers) {
-				// 		containerName := data.Identifier()
-				// 		helpers.Ensure("run", "-d", "--name", containerName,
-				// 			"--label", "healthcheck/config={\"Test\":[\"CMD-SHELL\",\"sleep 5\"],\"Interval\":1000000000,\"Timeout\":1000000000}",
-				// 			testutil.CommonImage, "sleep", nerdtest.Infinity)
-				// 		data.Set("containerName", containerName)
-				// 	},
-				// 	Cleanup: func(data test.Data, helpers test.Helpers) {
-				// 		helpers.Anyhow("rm", "-f", data.Get("containerName"))
-				// 	},
-				// 	Command: func(data test.Data, helpers test.Helpers) test.TestableCommand {
-				// 		return helpers.Command("container", "healthcheck", data.Get("containerName"))
-				// 	},
-				// 	Expected: test.Expects(1, nil, nil),
-				// },
+				{
+					Description: "Health check with timeout",
+					Setup: func(data test.Data, helpers test.Helpers) {
+						containerName := data.Identifier()
+						// Set timeout to 5 seconds, command will sleep for 10 seconds
+						helpers.Ensure("run", "-d", "--name", containerName,
+							"--label", "healthcheck/config={\"Test\":[\"CMD-SHELL\",\"sleep 10\"],\"Interval\":1000000000,\"Timeout\":5000000000}",
+							testutil.CommonImage, "sleep", nerdtest.Infinity)
+						data.Set("containerName", containerName)
+					},
+					Cleanup: func(data test.Data, helpers test.Helpers) {
+						helpers.Anyhow("rm", "-f", data.Get("containerName"))
+					},
+					Command: func(data test.Data, helpers test.Helpers) test.TestableCommand {
+						return helpers.Command("container", "healthcheck", data.Get("containerName"))
+					},
+					Expected: test.Expects(1, nil, func(stdout, info string, t *testing.T) {
+						if !strings.Contains(info, "health check timed out after 5s") {
+							t.Errorf("Expected stderr to contain timeout message, got: %s", info)
+						}
+					}),
+				},
 			},
 		},
 		// {

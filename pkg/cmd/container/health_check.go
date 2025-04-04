@@ -103,6 +103,7 @@ func HealthCheck(ctx context.Context, client *containerd.Client, container conta
 		return err
 	}
 
+	// Todo figure out if we can re-use exec lib method
 	// Create context with timeout for health check
 	execCtx, cancel := context.WithTimeout(ctx, time.Duration(config.Timeout))
 	defer cancel()
@@ -112,8 +113,6 @@ func HealthCheck(ctx context.Context, client *containerd.Client, container conta
 		cio.WithStdio,
 		cio.WithTerminal,
 	)
-
-	// Generate a unique exec ID using idgen.GenerateID() and truncate it
 	execID := "health-check-" + idgen.TruncateID(idgen.GenerateID())
 	startTime := time.Now()
 	process, err := task.Exec(execCtx, execID, processSpec, execOpts)
@@ -125,15 +124,6 @@ func HealthCheck(ctx context.Context, client *containerd.Client, container conta
 	if err := process.Start(execCtx); err != nil {
 		return fmt.Errorf("failed to start health check: %w", err)
 	}
-
-	// Wait for process to complete
-	exitStatusC, err := process.Wait(execCtx)
-	if err != nil {
-		return fmt.Errorf("failed to wait for health check: %w", err)
-	}
-	exitStatus := <-exitStatusC
-	var code uint32
-	code, _, _ = exitStatus.Result()
 
 	// Get current health status
 	var healthStatus HealthStatus
@@ -147,6 +137,22 @@ func HealthCheck(ctx context.Context, client *containerd.Client, container conta
 			Start:  time.Now(),
 		}
 	}
+
+	// Wait for process to complete
+	exitStatusC, err := process.Wait(execCtx)
+	if err != nil {
+		if execCtx.Err() == context.DeadlineExceeded {
+			// Health check timed out
+			if err := updateHealthStatus(ctx, container, &healthStatus, &config, 1, "health check timed out", startTime, time.Now()); err != nil {
+				return fmt.Errorf("failed to update health status after timeout: %w", err)
+			}
+			return fmt.Errorf("health check timed out after %v", config.Timeout)
+		}
+		return fmt.Errorf("failed to wait for health check: %w", err)
+	}
+	exitStatus := <-exitStatusC
+	var code uint32
+	code, _, _ = exitStatus.Result()
 
 	// Update health status and container labels
 	if err := updateHealthStatus(ctx, container, &healthStatus, &config, uint32(code), "", startTime, time.Now()); err != nil {
