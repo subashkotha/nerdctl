@@ -20,13 +20,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"strings"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/idgen"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -75,18 +75,17 @@ type Log struct {
 
 // HealthCheck executes the health check command for a container
 func HealthCheck(ctx context.Context, client *containerd.Client, container containerd.Container, globalOptions types.GlobalCommandOptions) error {
-	// verify container status
-	if err := verifyContainerStatus(container); err != nil {
+	// verify container status and get task
+	task, err := verifyContainerStatus(ctx, container)
+	if err != nil {
 		return err
 	}
 
-	// Get container info to access labels
+	// Check if container has health check configured
 	info, err := container.Info(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get container info: %w", err)
 	}
-
-	// Check if container has health check configured
 	configJSON, ok := info.Labels["healthcheck/config"]
 	if !ok {
 		return fmt.Errorf("container has no health check configured")
@@ -98,24 +97,10 @@ func HealthCheck(ctx context.Context, client *containerd.Client, container conta
 		return fmt.Errorf("invalid health check configuration: %w", err)
 	}
 
-	// Verify health check command exists
-	if len(config.Test) == 0 {
-		return fmt.Errorf("health check command is empty")
-	}
-
-	// Get container task
-	task, err := container.Task(ctx, nil)
+	// Prepare process spec for health check command
+	processSpec, err := prepareProcessSpec(&config)
 	if err != nil {
-		return fmt.Errorf("failed to get container task: %w", err)
-	}
-
-	// Create process spec for health check command
-	processSpec := &specs.Process{
-		Args: config.Test,
-		Env: []string{
-			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		},
-		Cwd: "/",
+		return err
 	}
 
 	// Create context with timeout for health check
@@ -128,12 +113,17 @@ func HealthCheck(ctx context.Context, client *containerd.Client, container conta
 		cio.WithTerminal,
 	)
 
-	// Generate a unique exec ID using timestamp and random number
-	rand.Seed(time.Now().UnixNano())
-	execID := fmt.Sprintf("health-check-%d-%d", time.Now().UnixNano(), rand.Int63())
+	// Generate a unique exec ID using idgen.GenerateID() and truncate it
+	execID := "health-check-" + idgen.TruncateID(idgen.GenerateID())
+	startTime := time.Now()
 	process, err := task.Exec(execCtx, execID, processSpec, execOpts)
 	if err != nil {
 		return fmt.Errorf("failed to execute health check: %w", err)
+	}
+
+	// Start the process
+	if err := process.Start(execCtx); err != nil {
+		return fmt.Errorf("failed to start health check: %w", err)
 	}
 
 	// Wait for process to complete
@@ -142,50 +132,51 @@ func HealthCheck(ctx context.Context, client *containerd.Client, container conta
 		return fmt.Errorf("failed to wait for health check: %w", err)
 	}
 	exitStatus := <-exitStatusC
-	code, _, err := exitStatus.Result()
-	if err != nil {
-		return fmt.Errorf("failed to wait for health check: %w", err)
+	var code uint32
+	code, _, _ = exitStatus.Result()
+
+	// Get current health status
+	var healthStatus HealthStatus
+	if statusJSON, ok := info.Labels["healthcheck/status"]; ok {
+		if err := json.Unmarshal([]byte(statusJSON), &healthStatus); err != nil {
+			return fmt.Errorf("invalid health status: %w", err)
+		}
+	} else {
+		healthStatus = HealthStatus{
+			Status: Starting,
+			Start:  time.Now(),
+		}
 	}
 
-	// Update health status based on exit code
-	status := "healthy"
-	if code != 0 {
-		status = "unhealthy"
-	}
-
-	// Update health status in container labels
-	statusJSON := fmt.Sprintf(`{"Status":"%s","FailingStreak":0}`, status)
-	_, err = container.SetLabels(ctx, map[string]string{
-		"healthcheck/status": statusJSON,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to update health status: %w", err)
+	// Update health status and container labels
+	if err := updateHealthStatus(ctx, container, &healthStatus, &config, uint32(code), "", startTime, time.Now()); err != nil {
+		return err
 	}
 
 	return nil
 }
 
-func verifyContainerStatus(container containerd.Container) error {
+func verifyContainerStatus(ctx context.Context, container containerd.Container) (containerd.Task, error) {
 	// Get container task to check status
-	task, err := container.Task(context.Background(), nil)
+	task, err := container.Task(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to get container task: %w", err)
+		return nil, fmt.Errorf("failed to get container task: %w", err)
 	}
 
 	// Check if container is running
-	status, err := task.Status(context.Background())
+	status, err := task.Status(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get container status: %w", err)
+		return nil, fmt.Errorf("failed to get container status: %w", err)
 	}
 	if status.Status != containerd.Running {
-		return fmt.Errorf("container is not running (status: %s)", status.Status)
+		return nil, fmt.Errorf("container is not running (status: %s)", status.Status)
 	}
 
-	return nil
+	return task, nil
 }
 
 // updateHealthStatus updates the health status based on the health check result
-func updateHealthStatus(healthStatus *HealthStatus, healthConfig *HealthConfig, exitCode uint32, output string, startTime, endTime time.Time) {
+func updateHealthStatus(ctx context.Context, container containerd.Container, healthStatus *HealthStatus, healthConfig *HealthConfig, exitCode uint32, output string, startTime, endTime time.Time) error {
 	// Create log entry
 	log := Log{
 		Start:    startTime,
@@ -213,6 +204,20 @@ func updateHealthStatus(healthStatus *HealthStatus, healthConfig *HealthConfig, 
 	if len(healthStatus.Log) > 5 {
 		healthStatus.Log = healthStatus.Log[len(healthStatus.Log)-5:]
 	}
+
+	// Update health status in container labels
+	statusJSON, err := json.Marshal(healthStatus)
+	if err != nil {
+		return fmt.Errorf("failed to marshal health status: %w", err)
+	}
+	_, err = container.SetLabels(ctx, map[string]string{
+		"healthcheck/status": string(statusJSON),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update health status: %w", err)
+	}
+
+	return nil
 }
 
 // prepareProcessSpec prepares the process spec for health check execution
@@ -232,10 +237,10 @@ func prepareProcessSpec(healthConfig *HealthConfig) (*specs.Process, error) {
 	case HealthCheckCmdShell:
 		args = []string{"/bin/sh", "-c", strings.Join(healthConfig.Test[1:], " ")}
 	default:
-		// If no command type specified, use the command as is
 		args = healthConfig.Test
 	}
 
+	// Todo confirm if Env is needed
 	processSpec := &specs.Process{
 		Args: args,
 		Env: []string{
