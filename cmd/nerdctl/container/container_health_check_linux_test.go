@@ -174,13 +174,18 @@ func TestContainerHealthCheck(t *testing.T) {
 						}
 					},
 				},
+			},
+		},
+		{
+			Description: "Advanced health check scenarios",
+			SubTests: []*test.Case{
 				{
-					Description: "Health check with timeout",
+					Description: "Health check times out due to long-running command",
 					Setup: func(data test.Data, helpers test.Helpers) {
 						containerName := data.Identifier()
-						// Set timeout to 5 seconds, command will sleep for 10 seconds
+						// Run a health check that sleeps for 10s, but timeout is set to 2s
 						helpers.Ensure("run", "-d", "--name", containerName,
-							"--label", "healthcheck/config={\"Test\":[\"CMD-SHELL\",\"sleep 10\"],\"Interval\":1000000000,\"Timeout\":5000000000}",
+							"--label", `healthcheck/config={"Test":["CMD-SHELL","sh -c 'sleep 10'"],"Interval":1000000000,"Timeout":2000000000}`,
 							testutil.CommonImage, "sleep", nerdtest.Infinity)
 						data.Set("containerName", containerName)
 					},
@@ -191,52 +196,47 @@ func TestContainerHealthCheck(t *testing.T) {
 						return helpers.Command("container", "healthcheck", data.Get("containerName"))
 					},
 					Expected: test.Expects(1, nil, func(stdout, info string, t *testing.T) {
-						if !strings.Contains(info, "health check timed out after 5s") {
+						if !strings.Contains(info, "health check timed out after 2s") {
 							t.Errorf("Expected stderr to contain timeout message, got: %s", info)
 						}
 					}),
 				},
+				//{
+				//	Description: "Health check with retries",
+				//	Setup: func(data test.Data, helpers test.Helpers) {
+				//		containerName := data.Identifier()
+				//		helpers.Ensure("run", "-d", "--name", containerName,
+				//			"--label", "healthcheck/config={\"Test\":[\"CMD-SHELL\",\"exit 1\"],\"Interval\":1000000000,\"Timeout\":1000000000,\"Retries\":2}",
+				//			testutil.CommonImage, "sleep", nerdtest.Infinity)
+				//		data.Set("containerName", containerName)
+				//	},
+				//	Cleanup: func(data test.Data, helpers test.Helpers) {
+				//		helpers.Anyhow("rm", "-f", data.Get("containerName"))
+				//	},
+				//	Command: func(data test.Data, helpers test.Helpers) test.TestableCommand {
+				//		return helpers.Command("container", "healthcheck", data.Get("containerName"))
+				//	},
+				//	Expected: test.Expects(1, nil, nil),
+				//},
+				//{
+				//	Description: "Health check with shell command",
+				//	Setup: func(data test.Data, helpers test.Helpers) {
+				//		containerName := data.Identifier()
+				//		helpers.Ensure("run", "-d", "--name", containerName,
+				//			"--label", "healthcheck/config={\"Test\":[\"CMD-SHELL\",\"test -f /etc/hostname\"],\"Interval\":1000000000,\"Timeout\":5000000000}",
+				//			testutil.CommonImage, "sleep", nerdtest.Infinity)
+				//		data.Set("containerName", containerName)
+				//	},
+				//	Cleanup: func(data test.Data, helpers test.Helpers) {
+				//		helpers.Anyhow("rm", "-f", data.Get("containerName"))
+				//	},
+				//	Command: func(data test.Data, helpers test.Helpers) test.TestableCommand {
+				//		return helpers.Command("container", "healthcheck", data.Get("containerName"))
+				//	},
+				//	Expected: test.Expects(0, nil, nil),
+				//},
 			},
 		},
-		// {
-		// 	Description: "Advanced health check scenarios",
-		// 	SubTests: []*test.Case{
-		// 		{
-		// 			Description: "Health check with retries",
-		// 			Setup: func(data test.Data, helpers test.Helpers) {
-		// 				containerName := data.Identifier()
-		// 				helpers.Ensure("run", "-d", "--name", containerName,
-		// 					"--label", "healthcheck/config={\"Test\":[\"CMD-SHELL\",\"exit 1\"],\"Interval\":1000000000,\"Timeout\":1000000000,\"Retries\":2}",
-		// 					testutil.CommonImage, "sleep", nerdtest.Infinity)
-		// 				data.Set("containerName", containerName)
-		// 			},
-		// 			Cleanup: func(data test.Data, helpers test.Helpers) {
-		// 				helpers.Anyhow("rm", "-f", data.Get("containerName"))
-		// 			},
-		// 			Command: func(data test.Data, helpers test.Helpers) test.TestableCommand {
-		// 				return helpers.Command("container", "healthcheck", data.Get("containerName"))
-		// 			},
-		// 			Expected: test.Expects(1, nil, nil),
-		// 		},
-		// 		{
-		// 			Description: "Health check with shell command",
-		// 			Setup: func(data test.Data, helpers test.Helpers) {
-		// 				containerName := data.Identifier()
-		// 				helpers.Ensure("run", "-d", "--name", containerName,
-		// 					"--label", "healthcheck/config={\"Test\":[\"CMD-SHELL\",\"test -f /etc/hostname\"],\"Interval\":1000000000,\"Timeout\":5000000000}",
-		// 					testutil.CommonImage, "sleep", nerdtest.Infinity)
-		// 				data.Set("containerName", containerName)
-		// 			},
-		// 			Cleanup: func(data test.Data, helpers test.Helpers) {
-		// 				helpers.Anyhow("rm", "-f", data.Get("containerName"))
-		// 			},
-		// 			Command: func(data test.Data, helpers test.Helpers) test.TestableCommand {
-		// 				return helpers.Command("container", "healthcheck", data.Get("containerName"))
-		// 			},
-		// 			Expected: test.Expects(0, nil, nil),
-		// 		},
-		// 	},
-		// },
 	}
 	testCase.Run(t)
 }

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"syscall"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
@@ -47,6 +48,7 @@ const (
 	HealthCheckTestNone = ""
 )
 
+// TODO move these structs to a util file
 // HealthConfig represents the health check configuration
 type HealthConfig struct {
 	Test        []string      `json:"test"`        // Test is the test to perform to check that the container is healthy
@@ -104,24 +106,20 @@ func HealthCheck(ctx context.Context, client *containerd.Client, container conta
 	}
 
 	// Todo figure out if we can re-use exec lib method
-	// Create context with timeout for health check
-	execCtx, cancel := context.WithTimeout(ctx, time.Duration(config.Timeout))
-	defer cancel()
+	fmt.Printf("Health check command: %v\n", processSpec.Args)
 
-	// Execute health check command with proper IO handling
-	execOpts := cio.NewCreator(
-		cio.WithStdio,
-		cio.WithTerminal,
-	)
 	execID := "health-check-" + idgen.TruncateID(idgen.GenerateID())
 	startTime := time.Now()
-	process, err := task.Exec(execCtx, execID, processSpec, execOpts)
+
+	process, err := task.Exec(ctx, execID, processSpec, cio.NewCreator(
+		cio.WithStdio,
+		cio.WithTerminal,
+	))
 	if err != nil {
 		return fmt.Errorf("failed to execute health check: %w", err)
 	}
 
-	// Start the process
-	if err := process.Start(execCtx); err != nil {
+	if err := process.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start health check: %w", err)
 	}
 
@@ -138,25 +136,33 @@ func HealthCheck(ctx context.Context, client *containerd.Client, container conta
 		}
 	}
 
-	// Wait for process to complete
-	exitStatusC, err := process.Wait(execCtx)
+	// Manually handle timeout using select
+	exitStatusC, err := process.Wait(ctx)
 	if err != nil {
-		if execCtx.Err() == context.DeadlineExceeded {
-			// Health check timed out
-			if err := updateHealthStatus(ctx, container, &healthStatus, &config, 1, "health check timed out", startTime, time.Now()); err != nil {
-				return fmt.Errorf("failed to update health status after timeout: %w", err)
-			}
-			return fmt.Errorf("health check timed out after %v", config.Timeout)
-		}
 		return fmt.Errorf("failed to wait for health check: %w", err)
 	}
-	exitStatus := <-exitStatusC
-	var code uint32
-	code, _, _ = exitStatus.Result()
 
-	// Update health status and container labels
-	if err := updateHealthStatus(ctx, container, &healthStatus, &config, uint32(code), "", startTime, time.Now()); err != nil {
-		return err
+	select {
+	case <-time.After(config.Timeout):
+		_ = process.Kill(ctx, syscall.SIGKILL) // Optional: force kill
+		if err := updateHealthStatus(ctx, container, &healthStatus, &config, 1, "health check timed out", startTime, time.Now()); err != nil {
+			return fmt.Errorf("failed to update health status after timeout: %w", err)
+		}
+		return fmt.Errorf("health check timed out after %v", config.Timeout)
+
+	case exitStatus := <-exitStatusC:
+		code, _, _ := exitStatus.Result()
+		if code != 0 {
+			if err := updateHealthStatus(ctx, container, &healthStatus, &config, code, "health check failed", startTime, time.Now()); err != nil {
+				return fmt.Errorf("failed to update health status: %w", err)
+			}
+			return fmt.Errorf("health check failed with code %d", code)
+		}
+
+		// Success path
+		if err := updateHealthStatus(ctx, container, &healthStatus, &config, 0, "healthy", startTime, time.Now()); err != nil {
+			return fmt.Errorf("failed to update health status after success: %w", err)
+		}
 	}
 
 	return nil
