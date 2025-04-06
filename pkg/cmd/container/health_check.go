@@ -17,6 +17,7 @@
 package container
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -60,11 +61,9 @@ type HealthConfig struct {
 
 // HealthStatus represents the current health status of a container
 type HealthStatus struct {
-	Status        string    `json:"status"`        // Status is the current health status
-	FailingStreak int       `json:"failingStreak"` // FailingStreak is the number of consecutive failures
-	Log           []Log     `json:"log"`           // Log contains the last few health check logs
-	Start         time.Time `json:"start"`         // Start is when the health check started
-	End           time.Time `json:"end"`           // End is when the health check ended
+	Status        string `json:"status"`        // Status is the current health status
+	FailingStreak int    `json:"failingStreak"` // FailingStreak is the number of consecutive failures
+	Log           []Log  `json:"log"`           // Log contains the last few health check logs
 }
 
 // Log represents a single health check execution log
@@ -88,7 +87,7 @@ func HealthCheck(ctx context.Context, client *containerd.Client, container conta
 	if err != nil {
 		return fmt.Errorf("failed to get container info: %w", err)
 	}
-	configJSON, ok := info.Labels["healthcheck/config"]
+	configJSON, ok := info.Labels[HealthConfigLabel]
 	if !ok {
 		return fmt.Errorf("container has no health check configured")
 	}
@@ -100,20 +99,18 @@ func HealthCheck(ctx context.Context, client *containerd.Client, container conta
 	}
 
 	// Prepare process spec for health check command
-	processSpec, err := prepareProcessSpec(&config)
+	processSpec, err := prepareProcessSpec(&config, container, ctx)
 	if err != nil {
 		return err
 	}
 
 	// Todo figure out if we can re-use exec lib method
-	fmt.Printf("Health check command: %v\n", processSpec.Args)
-
+	// fmt.Printf("Health check command: %v\n", processSpec.Args)
 	execID := "health-check-" + idgen.TruncateID(idgen.GenerateID())
+	var stdoutBuf, stderrBuf bytes.Buffer
 	startTime := time.Now()
-
 	process, err := task.Exec(ctx, execID, processSpec, cio.NewCreator(
-		cio.WithStdio,
-		cio.WithTerminal,
+		cio.WithStreams(nil, &stdoutBuf, &stderrBuf),
 	))
 	if err != nil {
 		return fmt.Errorf("failed to execute health check: %w", err)
@@ -123,20 +120,7 @@ func HealthCheck(ctx context.Context, client *containerd.Client, container conta
 		return fmt.Errorf("failed to start health check: %w", err)
 	}
 
-	// Get current health status
-	var healthStatus HealthStatus
-	if statusJSON, ok := info.Labels["healthcheck/status"]; ok {
-		if err := json.Unmarshal([]byte(statusJSON), &healthStatus); err != nil {
-			return fmt.Errorf("invalid health status: %w", err)
-		}
-	} else {
-		healthStatus = HealthStatus{
-			Status: Starting,
-			Start:  time.Now(),
-		}
-	}
-
-	// Manually handle timeout using select
+	// Todo finalize, how to handle timeout?
 	exitStatusC, err := process.Wait(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to wait for health check: %w", err)
@@ -145,22 +129,27 @@ func HealthCheck(ctx context.Context, client *containerd.Client, container conta
 	select {
 	case <-time.After(config.Timeout):
 		_ = process.Kill(ctx, syscall.SIGKILL) // Optional: force kill
-		if err := updateHealthStatus(ctx, container, &healthStatus, &config, 1, "health check timed out", startTime, time.Now()); err != nil {
+		healthOutput := strings.TrimSpace(stdoutBuf.String() + stderrBuf.String())
+		if err := updateHealthStatus(ctx, container, &config, 1, "health check timed out: "+healthOutput, startTime, time.Now()); err != nil {
 			return fmt.Errorf("failed to update health status after timeout: %w", err)
 		}
 		return fmt.Errorf("health check timed out after %v", config.Timeout)
 
 	case exitStatus := <-exitStatusC:
 		code, _, _ := exitStatus.Result()
+		healthOutput := strings.TrimSpace(stdoutBuf.String() + stderrBuf.String())
+		// Todo confirm if we need to log the output
+		fmt.Printf("Health check exit status: %d\n", code)
+		fmt.Printf("Health check output:\n%s\n", healthOutput)
 		if code != 0 {
-			if err := updateHealthStatus(ctx, container, &healthStatus, &config, code, "health check failed", startTime, time.Now()); err != nil {
+			if err := updateHealthStatus(ctx, container, &config, code, healthOutput, startTime, time.Now()); err != nil {
 				return fmt.Errorf("failed to update health status: %w", err)
 			}
 			return fmt.Errorf("health check failed with code %d", code)
 		}
 
 		// Success path
-		if err := updateHealthStatus(ctx, container, &healthStatus, &config, 0, "healthy", startTime, time.Now()); err != nil {
+		if err := updateHealthStatus(ctx, container, &config, 0, healthOutput, startTime, time.Now()); err != nil {
 			return fmt.Errorf("failed to update health status after success: %w", err)
 		}
 	}
@@ -188,77 +177,102 @@ func verifyContainerStatus(ctx context.Context, container containerd.Container) 
 }
 
 // updateHealthStatus updates the health status based on the health check result
-func updateHealthStatus(ctx context.Context, container containerd.Container, healthStatus *HealthStatus, healthConfig *HealthConfig, exitCode uint32, output string, startTime, endTime time.Time) error {
-	// Create log entry
-	log := Log{
-		Start:    startTime,
-		End:      endTime,
-		ExitCode: int(exitCode),
-		Output:   output,
+func updateHealthStatus(ctx context.Context, container containerd.Container, config *HealthConfig, exitCode uint32, output string, startTime, endTime time.Time) error {
+	// Get current health status
+	var healthStatus HealthStatus
+	info, err := container.Info(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get container info: %w", err)
+	}
+	if statusJSON, ok := info.Labels["healthcheck/status"]; ok {
+		if err := json.Unmarshal([]byte(statusJSON), &healthStatus); err != nil {
+			return fmt.Errorf("invalid health status: %w", err)
+		}
+	} else {
+		healthStatus = HealthStatus{
+			Status: Starting,
+		}
 	}
 
 	// Update health status based on exit code
 	if exitCode == 0 {
-		// Reset failing streak on success
-		healthStatus.FailingStreak = 0
 		healthStatus.Status = Healthy
+		healthStatus.FailingStreak = 0
 	} else {
-		// Increment failing streak
 		healthStatus.FailingStreak++
-		if healthStatus.FailingStreak >= healthConfig.Retries {
+		if healthStatus.FailingStreak >= config.Retries {
 			healthStatus.Status = Unhealthy
-			healthStatus.End = endTime
+		} else {
+			healthStatus.Status = Healthy
 		}
 	}
 
-	// Keep only the last 5 logs
-	healthStatus.Log = append(healthStatus.Log, log)
+	// Add log entry
+	healthStatus.Log = append(healthStatus.Log, Log{
+		Start:    startTime,
+		End:      endTime,
+		ExitCode: int(exitCode),
+		Output:   output,
+	})
+
+	// Keep only last 5 logs
 	if len(healthStatus.Log) > 5 {
 		healthStatus.Log = healthStatus.Log[len(healthStatus.Log)-5:]
 	}
 
-	// Update health status in container labels
+	// Update container labels
 	statusJSON, err := json.Marshal(healthStatus)
 	if err != nil {
 		return fmt.Errorf("failed to marshal health status: %w", err)
 	}
+
 	_, err = container.SetLabels(ctx, map[string]string{
-		"healthcheck/status": string(statusJSON),
+		HealthStatusLabel: string(statusJSON),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to update health status: %w", err)
+		return fmt.Errorf("failed to update container labels: %w", err)
 	}
 
 	return nil
 }
 
 // prepareProcessSpec prepares the process spec for health check execution
-func prepareProcessSpec(healthConfig *HealthConfig) (*specs.Process, error) {
-	if len(healthConfig.Test) == 0 {
+func prepareProcessSpec(healthConfig *HealthConfig, container containerd.Container, ctx context.Context) (*specs.Process, error) {
+	hcCommand := healthConfig.Test
+	if len(hcCommand) < 1 {
 		return nil, fmt.Errorf("no health check command specified")
 	}
 
-	cmdType := healthConfig.Test[0]
 	var args []string
-
-	switch cmdType {
-	case HealthCheckCmdNone, HealthCheckTestNone:
+	switch hcCommand[0] {
+	case HealthCheckTestNone, HealthCheckCmdNone:
 		return nil, fmt.Errorf("no health check defined")
 	case HealthCheckCmd:
-		args = healthConfig.Test[1:]
+		args = hcCommand[1:]
 	case HealthCheckCmdShell:
-		args = []string{"/bin/sh", "-c", strings.Join(healthConfig.Test[1:], " ")}
+		if len(hcCommand) < 2 || strings.TrimSpace(hcCommand[1]) == "" {
+			return nil, fmt.Errorf("no health check command specified")
+		}
+		args = []string{"/bin/sh", "-c", strings.Join(hcCommand[1:], " ")}
 	default:
-		args = healthConfig.Test
+		args = hcCommand
 	}
 
-	// Todo confirm if Env is needed
+	if len(args) < 1 || args[0] == "" {
+		return nil, fmt.Errorf("no health check command specified")
+	}
+
+	// Get container spec for environment and working directory
+	spec, err := container.Spec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get container spec: %w", err)
+	}
+
+	// Todo confirm if we need to merge with default PATH
 	processSpec := &specs.Process{
 		Args: args,
-		Env: []string{
-			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		},
-		Cwd: "/",
+		Env:  spec.Process.Env,
+		Cwd:  spec.Process.Cwd,
 	}
 
 	return processSpec, nil
