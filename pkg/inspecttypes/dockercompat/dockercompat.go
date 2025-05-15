@@ -44,6 +44,7 @@ import (
 	"github.com/containerd/go-cni"
 	"github.com/containerd/log"
 
+	"github.com/containerd/nerdctl/v2/pkg/healthcheck"
 	"github.com/containerd/nerdctl/v2/pkg/imgutil"
 	"github.com/containerd/nerdctl/v2/pkg/inspecttypes/native"
 	"github.com/containerd/nerdctl/v2/pkg/ipcutil"
@@ -210,9 +211,9 @@ type Config struct {
 	// TODO: Tty          bool        // Attach standard streams to a tty, including stdin if it is not closed.
 	// TODO: OpenStdin    bool        // Open stdin
 	// TODO: StdinOnce    bool        // If true, close stdin after the 1 attached client disconnects.
-	Env []string `json:",omitempty"` // List of environment variable to set in the container
-	Cmd []string `json:",omitempty"` // Command to run when starting the container
-	// TODO Healthcheck     *HealthConfig       `json:",omitempty"` // Healthcheck describes how to check the container is healthy
+	Env         []string                 `json:",omitempty"` // List of environment variable to set in the container
+	Cmd         []string                 `json:",omitempty"` // Command to run when starting the container
+	Healthcheck *healthcheck.Healthcheck `json:",omitempty"` // Healthcheck describes how to check the container is healthy
 	// TODO: ArgsEscaped     bool                `json:",omitempty"` // True if command is already escaped (meaning treat as a command line) (Windows specific).
 	// TODO: Image           string              // Name of the image as it was passed by the operator (e.g. could be symbolic)
 	Volumes    map[string]struct{} `json:",omitempty"` // List of volumes (mounts) used for the container
@@ -627,6 +628,14 @@ func ImageFromNative(nativeImage *native.Image) (*Image, error) {
 		Entrypoint:   imgOCI.Config.Entrypoint,
 		Labels:       imgOCI.Config.Labels,
 		ExposedPorts: portSet,
+	}
+
+	// Add health check if present in labels
+	var healthCheckConfig *healthcheck.Healthcheck
+	if healthStr, ok := imgOCI.Config.Labels[healthcheck.HealthcheckLabel]; ok {
+		if err := json.Unmarshal([]byte(healthStr), &healthCheckConfig); err == nil {
+			image.Config.Healthcheck = healthCheckConfig
+		}
 	}
 
 	return image, nil
