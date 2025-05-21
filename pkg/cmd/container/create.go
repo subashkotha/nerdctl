@@ -926,6 +926,7 @@ func validateHealthcheckFlags(options types.ContainerCreateOptions) error {
 		}
 	}
 
+	// Note: HealthCmd can be empty with other healthcheck flags set cause healthCmd could be coming from image.
 	if options.HealthInterval < 0 {
 		return fmt.Errorf("--health-interval cannot be negative")
 	}
@@ -942,9 +943,6 @@ func validateHealthcheckFlags(options types.ContainerCreateOptions) error {
 		return fmt.Errorf("--health-start-interval cannot be negative")
 	}
 
-	if healthFlagsSet && options.HealthCmd == "" {
-		return fmt.Errorf("--health-cmd must be set when using other --health-* flags")
-	}
 	return nil
 }
 

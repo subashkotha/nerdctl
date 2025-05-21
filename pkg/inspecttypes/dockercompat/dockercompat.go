@@ -241,7 +241,7 @@ type ContainerState struct {
 	Error      string
 	StartedAt  string
 	FinishedAt string
-	// TODO: Health     *Health `json:",omitempty"`
+	Health     *healthcheck.Health `json:",omitempty"`
 }
 
 type NetworkSettings struct {
@@ -581,13 +581,22 @@ func ContainerFromNative(n *native.Container) (*Container, error) {
 		c.Config.User = n.Labels[labels.User]
 	}
 
-	// Add health check if present in labels
+	// Add health check config if present in labels
 	if healthStr, ok := n.Labels[labels.HealthCheck]; ok && healthStr != "" {
 		healthCheckConfig, err := healthcheck.Parse(healthStr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse healthcheck label: %w", err)
 		}
 		c.Config.Healthcheck = healthCheckConfig
+	}
+
+	// Add health status to container state.
+	healthStatus, err := healthcheck.ReadHealthLogForInspect(n.Labels[labels.StateDir])
+	if err != nil {
+		return nil, fmt.Errorf("failed to get healthStatus log for inspect: %w", err)
+	}
+	if healthStatus != nil {
+		c.State.Health = healthStatus
 	}
 
 	return c, nil
