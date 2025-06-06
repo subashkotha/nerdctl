@@ -116,14 +116,15 @@ func probeHealthCheck(ctx context.Context, task containerd.Task, hc *Healthcheck
 
 // updateHealthStatus updates the health status based on the health check result
 func updateHealthStatus(ctx context.Context, container containerd.Container, hcConfig *Healthcheck, hcResult *HealthcheckResult) error {
-	// Get current health status from health log
-	currentHealth, err := readHealthLog(ctx, container)
+	// Get current health state from labels
+	currentState, err := readHealthStateFromLabels(ctx, container)
 	if err != nil {
-		return fmt.Errorf("failed to read health log: %w", err)
+		return fmt.Errorf("failed to read health state from labels: %w", err)
 	}
-	if currentHealth == nil {
-		currentHealth = &Health{
-			Status: Starting,
+	if currentState == nil {
+		currentState = &HealthState{
+			Status:        Starting,
+			FailingStreak: 0,
 		}
 	}
 
@@ -138,22 +139,24 @@ func updateHealthStatus(ctx context.Context, container containerd.Container, hcC
 
 	// Update health status based on exit code
 	if hcResult.ExitCode == 0 {
-		currentHealth.Status = Healthy
-		currentHealth.FailingStreak = 0
+		currentState.Status = Healthy
+		currentState.FailingStreak = 0
 	} else if !stillInStartPeriod {
-		currentHealth.FailingStreak++
-		if currentHealth.FailingStreak >= hcConfig.Retries {
-			currentHealth.Status = Unhealthy
+		currentState.FailingStreak++
+		if currentState.FailingStreak >= hcConfig.Retries {
+			currentState.Status = Unhealthy
 		} else {
-			currentHealth.Status = Healthy
+			currentState.Status = Healthy
 		}
 	}
 
-	// Prepend new log entry (newest first)
-	currentHealth.Log = append([]*HealthcheckResult{hcResult}, currentHealth.Log...)
+	// Write updated health state back to labels
+	if err := writeHealthStateToLabels(ctx, container, currentState); err != nil {
+		return fmt.Errorf("failed to write health state to labels: %w", err)
+	}
 
-	// Write updated health status to file
-	if err := writeHealthLog(ctx, container, currentHealth); err != nil {
+	// Store the latest health check result in the log file
+	if err := writeHealthLog(ctx, container, hcResult); err != nil {
 		return fmt.Errorf("failed to write health log: %w", err)
 	}
 

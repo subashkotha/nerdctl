@@ -121,4 +121,7 @@ const (
 
 	// HealthCheck stores the health check configuration used to run health checks on the container
 	HealthCheck = Prefix + "healthcheck"
+
+	// HealthState stores the current health state (status and failing streak).
+	HealthState = Prefix + "healthstate"
 )

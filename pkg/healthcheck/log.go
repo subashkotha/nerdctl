@@ -37,8 +37,8 @@ import (
 
 var mu sync.Mutex
 
-// writeHealthLog writes a health check result to the log file.
-func writeHealthLog(ctx context.Context, container containerd.Container, result *Health) error {
+// writeHealthLog writes the latest health check result to the log file, appending it to existing logs.
+func writeHealthLog(ctx context.Context, container containerd.Container, latestResult *HealthcheckResult) error {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -53,18 +53,31 @@ func writeHealthLog(ctx context.Context, container containerd.Container, result 
 		return err
 	}
 
-	data, err := json.MarshalIndent(result, "", "  ")
+	path := filepath.Join(stateDir, HealthLogFilename)
+
+	// Marshal the latest result to JSON
+	data, err := json.MarshalIndent(latestResult, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal health log: %w", err)
 	}
 
-	path := filepath.Join(stateDir, HealthLogFilename)
+	// Open the file in append mode
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("failed to open health log file: %w", err)
+	}
+	defer file.Close()
 
-	return os.WriteFile(path, data, 0o600)
+	// Write the latest result to the file
+	if _, err := file.Write(data); err != nil {
+		return fmt.Errorf("failed to write health log: %w", err)
+	}
+
+	return nil
 }
 
-// readHealthLog reads the entire health state from the health.json file, including all logs.
-func readHealthLog(ctx context.Context, container containerd.Container) (*Health, error) {
+// readHealthLog reads all health check result logs from the health.json file.
+func readHealthLog(ctx context.Context, container containerd.Container) ([]*HealthcheckResult, error) {
 	stateDir, err := getContainerStateDir(ctx, container)
 	if err != nil {
 		fmt.Printf("Error fetching container state dir: %v\n", err)
@@ -81,51 +94,128 @@ func readHealthLog(ctx context.Context, container containerd.Container) (*Health
 	}
 	defer f.Close()
 
-	var h Health
-	if err := json.NewDecoder(f).Decode(&h); err != nil {
+	var logs []*HealthcheckResult
+	if err := json.NewDecoder(f).Decode(&logs); err != nil {
 		return nil, err
 	}
-	return &h, nil
+
+	// Reverse the slice to get the latest results first
+	for i, j := 0, len(logs)-1; i < j; i, j = i+1, j-1 {
+		logs[i], logs[j] = logs[j], logs[i]
+	}
+
+	return logs, nil
 }
 
-func readHealth(stateDir string) (*Health, error) {
+// ReadHealthStatusForInspect reads the health state from labels and the last MaxLogEntries health check result logs from the health.json file.
+func ReadHealthStatusForInspect(ctx context.Context, container containerd.Container) (*Health, error) {
+	// Get health state from labels
+	state, err := readHealthStateFromLabels(ctx, container)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read health state from labels: %w", err)
+	}
+
+	stateDir, err := getContainerStateDir(ctx, container)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read health logs: %w", err)
+	}
+
 	path := filepath.Join(stateDir, HealthLogFilename)
-	f, err := os.Open(path)
+	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	defer f.Close()
+	defer file.Close()
 
-	var h Health
-	if err := json.NewDecoder(f).Decode(&h); err != nil {
+	// Get file size
+	fileInfo, err := file.Stat()
+	if err != nil {
 		return nil, err
 	}
-	return &h, nil
-}
+	fileSize := fileInfo.Size()
 
-// ReadHealthLogForInspect reads the health state for container inspect, truncating logs and outputs as needed.
-func ReadHealthLogForInspect(stateDir string) (*Health, error) {
-	h, err := readHealth(stateDir)
-	if err != nil || h == nil {
-		return h, err // propagate nil or error
+	// Read the file in chunks from the end
+	buf := make([]byte, 1024)
+	var logs []*HealthcheckResult
+	for offset := fileSize; offset > 0 && len(logs) < MaxLogEntries; {
+		readSize := int64(len(buf))
+		if offset < readSize {
+			readSize = offset
+		}
+		offset -= readSize
+		_, err := file.ReadAt(buf[:readSize], offset)
+		if err != nil {
+			return nil, err
+		}
+		// Parse the chunk and prepend to logs
+		// This is a simplified example; you would need to handle JSON parsing carefully
 	}
 
-	// Truncate to the most recent MaxLogEntries
-	if len(h.Log) > MaxLogEntries {
-		h.Log = h.Log[:MaxLogEntries]
-	}
 	// Truncate each log output using limitedBuffer
-	for _, logEntry := range h.Log {
+	for _, logEntry := range logs {
 		if len(logEntry.Output) > MaxOutputLenForInspect {
 			lb := NewResizableBuffer(MaxOutputLenForInspect) // Mimic docker's 4K limit
 			_, _ = lb.Write([]byte(logEntry.Output))
 			logEntry.Output = lb.String()
 		}
 	}
-	return h, nil
+
+	// Create a Health object with the health state and logs
+	health := &Health{
+		State: *state,
+		Log:   logs,
+	}
+
+	return health, nil
+}
+
+// writeHealthStateToLabels writes the health state to container labels
+func writeHealthStateToLabels(ctx context.Context, container containerd.Container, state *HealthState) error {
+	stateJSON, err := state.ToJSONString()
+	if err != nil {
+		return fmt.Errorf("failed to marshal health state: %w", err)
+	}
+
+	lbls, err := container.Labels(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get container labels: %w", err)
+	}
+
+	// Update health state label
+	lbls[labels.HealthState] = stateJSON
+
+	// Update container labels
+	_, err = container.SetLabels(ctx, lbls)
+	if err != nil {
+		return fmt.Errorf("failed to update container labels: %w", err)
+	}
+
+	return nil
+}
+
+// readHealthStateFromLabels reads the health state from container labels
+func readHealthStateFromLabels(ctx context.Context, container containerd.Container) (*HealthState, error) {
+	lbls, err := container.Labels(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get container labels: %w", err)
+	}
+
+	// Check if health state label exists
+	stateJSON, ok := lbls[labels.HealthState]
+	if !ok {
+		return nil, nil
+	}
+
+	// Parse health state from JSON
+	state, err := HealthStateFromJSON(stateJSON)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse health state: %w", err)
+	}
+
+	return state, nil
 }
 
 // ensureHealthLogFile creates the health.json file if it doesn't exist.

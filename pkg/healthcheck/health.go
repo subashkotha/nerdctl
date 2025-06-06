@@ -39,11 +39,16 @@ const (
 	TestNone = ""
 )
 
+// HealthState stores the current health state of a container
+type HealthState struct {
+	Status        HealthStatus // Status is one of [Starting], [Healthy] or [Unhealthy]
+	FailingStreak int          // FailingStreak is the number of consecutive failures
+}
+
 // Health stores information about the container's healthcheck results
 type Health struct {
-	Status        HealthStatus         // Status is one of [Starting], [Healthy] or [Unhealthy].
-	FailingStreak int                  // FailingStreak is the number of consecutive failures
-	Log           []*HealthcheckResult // Log contains the last few results (oldest first)
+	State HealthState          // State contains the current health state
+	Log   []*HealthcheckResult // Log contains the last few results (oldest first)
 }
 
 // HealthcheckResult stores information about a single run of a healthcheck probe
@@ -62,6 +67,24 @@ type Healthcheck struct {
 	Retries       int           `json:"Retries,omitempty"`       // Retries is the number of consecutive failures needed to consider a container as unhealthy
 	StartPeriod   time.Duration `json:"StartPeriod,omitempty"`   // StartPeriod is the period for the container to initialize before the health check starts
 	StartInterval time.Duration `json:"StartInterval,omitempty"` // StartInterval is the time between health checks during the start period
+}
+
+// ToJSONString serializes HealthState to a JSON string for label storage
+func (hs *HealthState) ToJSONString() (string, error) {
+	b, err := json.Marshal(hs)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// HealthStateFromJSON deserializes a JSON string into a HealthState
+func HealthStateFromJSON(s string) (*HealthState, error) {
+	var hs HealthState
+	if err := json.Unmarshal([]byte(s), &hs); err != nil {
+		return nil, err
+	}
+	return &hs, nil
 }
 
 // ToJSONString serializes a Healthcheck struct to a JSON string
